@@ -27,6 +27,15 @@ go.work.sum
 # env file
 .env
 
+# Local recordings and generated transcripts may contain private speech.
+/recordings/
+/voices/
+/transcripts/
+/transcripts_prompt/
+
+# Locally built CLI binary.
+/transcribe
+
 # Editor/IDE
 # .idea/
 # .vscode/
