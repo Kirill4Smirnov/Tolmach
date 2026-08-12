@@ -235,3 +235,65 @@ does not provide speaker diarization; Speechmatics and Soniox do.
 ```sh
 CGO_ENABLED=0 go test ./...
 ```
+
+## Telegram bot
+
+The bot uses long polling and needs no public web server. Add these values to
+the private `.env` file:
+
+```dotenv
+TELEGRAM_BOT_TOKEN=123456:replace-me
+TELEGRAM_ALLOWED_USER_IDS=123456789
+```
+
+Several allowed numeric user IDs may be separated with commas. The first
+version deliberately ignores unknown users and accepts media only in private
+chats. Provider keys and the optional proxy use the same `.env` file as the
+evaluation CLI.
+
+Build and run:
+
+```sh
+CGO_ENABLED=0 go build -trimpath -o tolmach-bot ./cmd/bot
+./tolmach-bot
+```
+
+Check the database, provider configuration, and Telegram token without polling
+or consuming updates:
+
+```sh
+./tolmach-bot --check
+```
+
+The default transcription provider is Groq `whisper-large-v3`; Turbo is not
+used. Soniox is the default diarization provider, with Speechmatics available
+as an alternative. The bot accepts voice, video notes, audio, video, and
+audio/video documents. It has one worker and streams all downloads/uploads.
+
+Commands:
+
+```text
+/settings
+/language ru
+/language auto
+/provider groq
+/provider soniox
+/diarization_provider soniox
+/translate en
+/cancel
+```
+
+Send `/translate en` as a reply to the first message of a transcript. Language
+codes are stored per user. The inline buttons under a transcript run speaker
+diarization or open the provider chooser for a new transcription.
+
+Transcripts, translations, job metadata, and user settings are stored in
+`data/tolmach.db`; the database is forced to mode `0600`. Identical completed
+requests are served from cache. Completed and failed jobs are removed after
+seven days by default (`--retention-days` changes this). Media files are kept
+only in private temporary directories during active processing. Long results
+are split into Telegram messages and also sent as a private `.txt` document.
+
+The sample hardened service unit is
+[`deploy/tolmach-bot.service`](deploy/tolmach-bot.service). Adjust its paths
+before installation.

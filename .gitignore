@@ -35,6 +35,8 @@ go.work.sum
 
 # Locally built CLI binary.
 /transcribe
+/tolmach-bot
+/data/
 
 # Editor/IDE
 # .idea/

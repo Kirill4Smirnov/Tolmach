@@ -1,0 +1,20 @@
+[Unit]
+Description=Tolmach Telegram transcription bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tolmach
+ExecStart=/opt/tolmach/tolmach-bot --env-file /opt/tolmach/.env --database /opt/tolmach/data/tolmach.db
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/tolmach/data
+
+[Install]
+WantedBy=multi-user.target
