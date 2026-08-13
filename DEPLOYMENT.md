@@ -7,10 +7,6 @@ long polling и SQLite-очередь не рассчитаны на гориз�
 
 Создайте несекретные настройки:
 
-```sh
-cp deploy/compose.env.example deploy/compose.env
-```
-
 Укажите в `deploy/compose.env` разрешённые Telegram ID:
 
 ```dotenv
@@ -19,19 +15,14 @@ TELEGRAM_ALLOWED_USER_IDS=123456789,987654321
 
 Создайте файлы секретов:
 
-```sh
-mkdir -m 700 secrets
-printf '%s\n' 'groq-key' > secrets/groq_api_key
-printf '%s\n' 'soniox-key' > secrets/soniox_api_key
-printf '%s\n' 'speechmatics-key' > secrets/speechmatics_api_key
-printf '%s\n' 'telegram-token' > secrets/telegram_bot_token
-chmod 644 secrets/*
-chmod 600 deploy/compose.env
+```
+secrets/groq_api_key
+secrets/soniox_api_key
+secrets/speechmatics_api_key
+secrets/telegram_bot_token
 ```
 
-Compose монтирует secrets как read-only файлы. Для non-root процесса файлам
-нужен режим `0644`; от других пользователей хоста их защищает каталог `0700`.
-Каталог и конфигурация исключены из Git и Docker build context.
+В каждом файле должен лежать соответсвующий ключ/токен.
 
 ## 2. Запуск
 
