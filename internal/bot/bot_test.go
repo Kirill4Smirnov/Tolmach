@@ -116,6 +116,52 @@ func TestMediaExtensionNormalizesTelegramVoiceOGA(t *testing.T) {
 	}
 }
 
+func TestActiveJobIsRequeuedWhenProcessContextIsCanceled(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "bot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	requestStarted := make(chan struct{})
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case "/botsecret/editMessageText":
+			return jsonResponse(request, http.StatusOK, `{"ok":true,"result":true}`), nil
+		case "/botsecret/getFile":
+			close(requestStarted)
+			<-request.Context().Done()
+			return nil, request.Context().Err()
+		default:
+			t.Fatalf("unexpected request: %s %s", request.Method, request.URL.Path)
+			return nil, nil
+		}
+	})
+	client, _ := telegram.NewClient("secret", telegram.Options{BaseURL: "https://telegram.test", HTTPClient: &http.Client{Transport: transport}})
+	application, err := New(client, database, &fakeEngine{}, Config{AllowedUsers: map[int64]bool{42: true}, TempDir: t.TempDir()}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID, err := database.CreateJob(context.Background(), store.Job{UserID: 42, ChatID: 7, SourceMessageID: 9, ResultMessageID: 100,
+		FileID: "file-1", FileUniqueID: "unique-1", MediaKind: "voice", Provider: "groq", Model: transcription.GroqModel,
+		Language: "ru", Status: "queued"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		application.processJob(ctx, jobID)
+	}()
+	<-requestStarted
+	cancel()
+	<-done
+	job, err := database.Job(context.Background(), jobID)
+	if err != nil || job.Status != "queued" || !strings.Contains(job.Error, "shutdown") {
+		t.Fatalf("job=%#v err=%v", job, err)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }

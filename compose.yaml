@@ -1,0 +1,65 @@
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tolmach-bot:local
+    restart: unless-stopped
+    init: true
+    env_file:
+      - deploy/compose.env
+    environment:
+      GROQ_API_KEY_FILE: /run/secrets/groq_api_key
+      SONIOX_API_KEY_FILE: /run/secrets/soniox_api_key
+      SPEECHMATICS_API_KEY_FILE: /run/secrets/speechmatics_api_key
+      TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_bot_token
+    command:
+      - --env-file
+      - /dev/null
+      - --database
+      - /app/data/tolmach.db
+      - --retention-days
+      - "7"
+      - --log-file
+      - /app/logs/tolmach.jsonl
+    volumes:
+      - tolmach-data:/app/data
+      - tolmach-logs:/app/logs
+    secrets:
+      - groq_api_key
+      - soniox_api_key
+      - speechmatics_api_key
+      - telegram_bot_token
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 75s
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "5"
+    # If the API proxy runs on the Linux Docker host, use
+    # HTTP(S)_PROXY=http://host.docker.internal:7890 in .env and uncomment:
+    # extra_hosts:
+    #   - host.docker.internal:host-gateway
+
+volumes:
+  tolmach-data:
+    name: tolmach-data
+  tolmach-logs:
+    name: tolmach-logs
+
+secrets:
+  groq_api_key:
+    file: ./secrets/groq_api_key
+  soniox_api_key:
+    file: ./secrets/soniox_api_key
+  speechmatics_api_key:
+    file: ./secrets/speechmatics_api_key
+  telegram_bot_token:
+    file: ./secrets/telegram_bot_token

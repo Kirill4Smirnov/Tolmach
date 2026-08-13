@@ -37,6 +37,9 @@ func TestSettingsJobsCacheAndTranslations(t *testing.T) {
 	if err := store.CompleteJob(ctx, id, "Текст", "", "ru", 5.5, 2*time.Second); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.MarkJobPublished(ctx, id); err != nil {
+		t.Fatal(err)
+	}
 	cached, found, err := store.CachedJob(ctx, "unique", "groq", "whisper-large-v3", "auto", false)
 	if err != nil || !found || cached.Text != "Текст" || cached.DurationSeconds != 5.5 {
 		t.Fatalf("cached=%#v found=%v err=%v", cached, found, err)
@@ -73,5 +76,19 @@ func TestSettingsJobsCacheAndTranslations(t *testing.T) {
 	recovered, err := store.RecoverPendingJobs(ctx)
 	if err != nil || len(recovered) != 2 || recovered[0] != queuedID || recovered[1] != runningID {
 		t.Fatalf("recovered=%#v err=%v", recovered, err)
+	}
+	activeID, err := store.CreateJob(ctx, Job{UserID: 42, ChatID: 7, SourceMessageID: 14, FileID: "f4", FileUniqueID: "u4", MediaKind: "voice", Provider: "groq", Model: "m", Language: "ru", Status: "queued"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if running, err := store.MarkJobRunning(ctx, activeID); err != nil || !running {
+		t.Fatalf("running=%v err=%v", running, err)
+	}
+	if err := store.RequeueJob(ctx, activeID, "shutdown"); err != nil {
+		t.Fatal(err)
+	}
+	requeued, err := store.Job(ctx, activeID)
+	if err != nil || requeued.Status != "queued" || requeued.Error != "shutdown" {
+		t.Fatalf("requeued=%#v err=%v", requeued, err)
 	}
 }

@@ -37,6 +37,8 @@ go.work.sum
 /transcribe
 /tolmach-bot
 /data/
+/secrets/
+/deploy/compose.env
 
 # Editor/IDE
 # .idea/

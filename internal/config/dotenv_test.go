@@ -52,3 +52,25 @@ func TestLoadDotEnvMissingFile(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestSecretPrefersFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(path, []byte("from-file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_SECRET", "from-env")
+	t.Setenv("TEST_SECRET_FILE", path)
+	value, err := Secret("TEST_SECRET")
+	if err != nil || value != "from-file" {
+		t.Fatalf("value=%q err=%v", value, err)
+	}
+}
+
+func TestSecretFallsBackToEnvironment(t *testing.T) {
+	t.Setenv("TEST_SECRET", " value ")
+	t.Setenv("TEST_SECRET_FILE", "")
+	value, err := Secret("TEST_SECRET")
+	if err != nil || value != "value" {
+		t.Fatalf("value=%q err=%v", value, err)
+	}
+}

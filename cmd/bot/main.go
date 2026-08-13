@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -22,6 +23,8 @@ import (
 	"tolmach/internal/store"
 	"tolmach/internal/telegram"
 	"tolmach/internal/transcription"
+
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 type options struct {
@@ -35,6 +38,7 @@ type options struct {
 	logLevel      string
 	retentionDays int
 	check         bool
+	logFile       string
 }
 
 func main() { os.Exit(run(os.Args[1:])) }
@@ -53,6 +57,7 @@ func run(args []string) int {
 	flags.StringVar(&opts.logLevel, "log-level", "info", "debug, info, warn, or error")
 	flags.IntVar(&opts.retentionDays, "retention-days", 7, "days to retain completed transcripts and translations")
 	flags.BoolVar(&opts.check, "check", false, "validate configuration and Telegram credentials, then exit")
+	flags.StringVar(&opts.logFile, "log-file", "", "optional persistent JSON log file with rotation")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -68,7 +73,12 @@ func run(args []string) int {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 1
 	}
-	allowed, err := parseAllowedUsers(os.Getenv("TELEGRAM_ALLOWED_USER_IDS"))
+	allowedValue, err := config.Secret("TELEGRAM_ALLOWED_USER_IDS")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	allowed, err := parseAllowedUsers(allowedValue)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: TELEGRAM_ALLOWED_USER_IDS:", err)
 		return 1
@@ -78,7 +88,12 @@ func run(args []string) int {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 2
 	}
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	logger, closeLogs, err := createLogger(opts.logFile, level)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	defer closeLogs()
 
 	if directory := filepath.Dir(opts.databasePath); directory != "." {
 		if err := os.MkdirAll(directory, 0o700); err != nil {
@@ -93,7 +108,12 @@ func run(args []string) int {
 	}
 	defer database.Close()
 
-	telegramClient, err := telegram.NewClient(os.Getenv("TELEGRAM_BOT_TOKEN"), telegram.Options{BaseURL: opts.telegramURL})
+	telegramToken, err := config.Secret("TELEGRAM_BOT_TOKEN")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	telegramClient, err := telegram.NewClient(telegramToken, telegram.Options{BaseURL: opts.telegramURL})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: TELEGRAM_BOT_TOKEN is missing or invalid")
 		return 1
@@ -134,20 +154,48 @@ func run(args []string) int {
 	return 0
 }
 
+func createLogger(path string, level slog.Level) (*slog.Logger, func(), error) {
+	var output io.Writer = os.Stderr
+	closeLogs := func() {}
+	if strings.TrimSpace(path) != "" {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return nil, closeLogs, fmt.Errorf("create log directory: %w", err)
+		}
+		rotating := &lumberjack.Logger{
+			Filename: path, MaxSize: 20, MaxBackups: 10, MaxAge: 30, Compress: true,
+		}
+		output = io.MultiWriter(os.Stderr, rotating)
+		closeLogs = func() { _ = rotating.Close() }
+	}
+	return slog.New(slog.NewJSONHandler(output, &slog.HandlerOptions{Level: level})), closeLogs, nil
+}
+
 func createService() (*transcription.Service, error) {
-	groqClient, err := groq.NewClient(os.Getenv("GROQ_API_KEY"), groq.Options{})
+	groqKey, err := config.Secret("GROQ_API_KEY")
+	if err != nil {
+		return nil, err
+	}
+	groqClient, err := groq.NewClient(groqKey, groq.Options{})
 	if err != nil {
 		return nil, errors.New("GROQ_API_KEY is required for default transcription and translation")
 	}
 	service := &transcription.Service{Groq: groqClient}
-	if key := strings.TrimSpace(os.Getenv("SONIOX_API_KEY")); key != "" {
+	sonioxKey, err := config.Secret("SONIOX_API_KEY")
+	if err != nil {
+		return nil, err
+	}
+	if key := sonioxKey; key != "" {
 		client, err := soniox.NewClient(key, soniox.Options{})
 		if err != nil {
 			return nil, fmt.Errorf("configure Soniox: %w", err)
 		}
 		service.Soniox = client
 	}
-	if key := strings.TrimSpace(os.Getenv("SPEECHMATICS_API_KEY")); key != "" {
+	speechmaticsKey, err := config.Secret("SPEECHMATICS_API_KEY")
+	if err != nil {
+		return nil, err
+	}
+	if key := speechmaticsKey; key != "" {
 		client, err := speechmatics.NewClient(key, speechmatics.Options{})
 		if err != nil {
 			return nil, fmt.Errorf("configure Speechmatics: %w", err)

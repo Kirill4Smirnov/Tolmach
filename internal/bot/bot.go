@@ -386,6 +386,8 @@ func (b *Bot) createAndQueue(ctx context.Context, job store.Job) error {
 	}
 	select {
 	case b.queue <- jobID:
+		b.logger.Info("Transcription queued", "job_id", jobID, "user_id", job.UserID, "media_kind", job.MediaKind,
+			"provider", job.Provider, "diarization", job.Diarization, "queue_ahead", max(0, len(b.queue)-1))
 		return nil
 	default:
 		_ = b.store.FailJob(ctx, jobID, "queue is full")
@@ -411,19 +413,37 @@ func (b *Bot) processJob(parent context.Context, jobID int64) {
 		b.logger.Error("Read queued job failed", "job_id", jobID, "error", err)
 		return
 	}
+	if job.Status == "ready" {
+		if b.publishResult(parent, job, false) {
+			if err := b.store.MarkJobPublished(parent, job.ID); err != nil {
+				b.logger.Error("Published job state could not be committed", "job_id", job.ID, "error", err)
+			}
+		}
+		return
+	}
 	running, err := b.store.MarkJobRunning(parent, job.ID)
 	if err != nil {
 		b.failJob(parent, job, err)
 		return
 	}
+	if !running {
+		_ = b.telegram.EditMessage(parent, job.ChatID, job.ResultMessageID, "Обработка отменена.", nil)
+		return
+	}
+	b.logger.Info("Transcription started", "job_id", job.ID, "user_id", job.UserID, "provider", job.Provider,
+		"diarization", job.Diarization, "language", job.Language)
 	if cached, found, cacheErr := b.store.CachedJob(parent, job.FileUniqueID, job.Provider, job.Model, job.Language, job.Diarization); cacheErr == nil && found && cached.ID != job.ID {
 		_ = b.store.CompleteJob(parent, job.ID, cached.Text, cached.DiarizedText, cached.DetectedLanguages, cached.DurationSeconds, 0)
 		job.Text, job.DiarizedText, job.DetectedLanguages, job.DurationSeconds, job.Status = cached.Text, cached.DiarizedText, cached.DetectedLanguages, cached.DurationSeconds, "completed"
-		b.publishResult(parent, job, true)
-		return
-	}
-	if !running {
-		_ = b.telegram.EditMessage(parent, job.ChatID, job.ResultMessageID, "Обработка отменена.", nil)
+		if !b.publishResult(parent, job, true) {
+			return
+		}
+		if err := b.store.MarkJobPublished(parent, job.ID); err != nil {
+			b.logger.Error("Published cached job state could not be committed", "job_id", job.ID, "error", err)
+			return
+		}
+		b.logger.Info("Transcription completed", "job_id", job.ID, "provider", job.Provider, "cached", true,
+			"audio_seconds", job.DurationSeconds, "processing_ms", 0)
 		return
 	}
 	_ = b.telegram.EditMessage(parent, job.ChatID, job.ResultMessageID, "Распознаю через "+providerName(job.Provider)+"…", nil)
@@ -460,6 +480,17 @@ func (b *Bot) processJob(parent context.Context, jobID int64) {
 	started := time.Now()
 	result, err := b.service.Transcribe(jobCtx, transcription.Request{FilePath: tempPath, Provider: job.Provider, Language: job.Language, Diarization: job.Diarization})
 	if err != nil {
+		if parent.Err() != nil {
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			requeueErr := b.store.RequeueJob(shutdownCtx, job.ID, "interrupted by process shutdown")
+			shutdownCancel()
+			if requeueErr != nil {
+				b.logger.Error("Job could not be requeued during shutdown", "job_id", job.ID, "provider", job.Provider, "error", requeueErr)
+			} else {
+				b.logger.Info("Job requeued during shutdown", "job_id", job.ID, "provider", job.Provider)
+			}
+			return
+		}
 		b.failJob(parent, job, err)
 		return
 	}
@@ -473,11 +504,33 @@ func (b *Bot) processJob(parent context.Context, jobID int64) {
 		return
 	}
 	job.Text, job.DiarizedText, job.DetectedLanguages, job.DurationSeconds = result.Text, result.Diarized, languages, result.Duration
-	job.Status = "completed"
-	b.publishResult(parent, job, false)
+	job.Status = "ready"
+	if !b.publishResult(parent, job, false) {
+		return
+	}
+	if err := b.store.MarkJobPublished(parent, job.ID); err != nil {
+		b.logger.Error("Published job state could not be committed", "job_id", job.ID, "error", err)
+		return
+	}
+	b.logger.Info("Transcription completed", "job_id", job.ID, "provider", job.Provider, "cached", false,
+		"audio_seconds", job.DurationSeconds, "processing_ms", processing.Milliseconds(), "languages", languages)
 }
 
 func (b *Bot) failJob(ctx context.Context, job store.Job, err error) {
+	if ctx.Err() != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		current, readErr := b.store.Job(shutdownCtx, job.ID)
+		if readErr == nil && current.Status == "running" {
+			readErr = b.store.RequeueJob(shutdownCtx, job.ID, "interrupted by process shutdown")
+		}
+		shutdownCancel()
+		if readErr != nil {
+			b.logger.Error("Job could not be requeued during shutdown", "job_id", job.ID, "provider", job.Provider, "error", readErr)
+		} else {
+			b.logger.Info("Job preserved during shutdown", "job_id", job.ID, "provider", job.Provider, "status", current.Status)
+		}
+		return
+	}
 	_ = b.store.FailJob(ctx, job.ID, err.Error())
 	message := "Не удалось распознать запись. Попробуйте другой провайдер или повторите позже."
 	if errors.Is(err, context.Canceled) {
@@ -489,7 +542,7 @@ func (b *Bot) failJob(ctx context.Context, job store.Job, err error) {
 	b.logger.Error("Transcription failed", "job_id", job.ID, "provider", job.Provider, "error", err)
 }
 
-func (b *Bot) publishResult(ctx context.Context, job store.Job, cached bool) {
+func (b *Bot) publishResult(ctx context.Context, job store.Job, cached bool) bool {
 	text := job.Text
 	if job.Diarization && job.DiarizedText != "" {
 		text = job.DiarizedText
@@ -505,7 +558,7 @@ func (b *Bot) publishResult(ctx context.Context, job store.Job, cached bool) {
 	markup := resultKeyboard(job.ID, !job.Diarization)
 	if err := b.telegram.EditMessage(ctx, job.ChatID, job.ResultMessageID, chunks[0], markup); err != nil {
 		b.logger.Error("Publish result failed", "job_id", job.ID, "error", err)
-		return
+		return false
 	}
 	if err := b.sendChunks(ctx, job.ChatID, 0, chunks[1:]); err != nil {
 		b.logger.Error("Publish result continuation failed", "job_id", job.ID, "error", err)
@@ -515,6 +568,7 @@ func (b *Bot) publishResult(ctx context.Context, job store.Job, cached bool) {
 			b.logger.Error("Publish transcript document failed", "job_id", job.ID, "error", err)
 		}
 	}
+	return true
 }
 
 func (b *Bot) sendTranscriptDocument(ctx context.Context, job store.Job, text string) error {

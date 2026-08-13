@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 )
@@ -67,4 +68,26 @@ func validEnvKey(key string) bool {
 		return false
 	}
 	return true
+}
+
+// Secret reads NAME_FILE first (Docker/Kubernetes secret convention), then
+// falls back to NAME for local development. Secret files must be small and
+// contain a single value; trailing whitespace is removed.
+func Secret(name string) (string, error) {
+	if path := strings.TrimSpace(os.Getenv(name + "_FILE")); path != "" {
+		file, err := os.Open(path)
+		if err != nil {
+			return "", fmt.Errorf("open %s_FILE: %w", name, err)
+		}
+		defer file.Close()
+		value, err := io.ReadAll(io.LimitReader(file, (64<<10)+1))
+		if err != nil {
+			return "", fmt.Errorf("read %s_FILE: %w", name, err)
+		}
+		if len(value) > 64<<10 {
+			return "", fmt.Errorf("%s_FILE exceeds 64 KiB", name)
+		}
+		return strings.TrimSpace(string(value)), nil
+	}
+	return strings.TrimSpace(os.Getenv(name)), nil
 }

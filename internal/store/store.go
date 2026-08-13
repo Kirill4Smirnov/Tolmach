@@ -209,13 +209,32 @@ func (s *Store) CancelQueuedJobs(ctx context.Context, userID int64) (int64, erro
 	return result.RowsAffected()
 }
 
+func (s *Store) RequeueJob(ctx context.Context, jobID int64, reason string) error {
+	if len(reason) > 500 {
+		reason = reason[:500]
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET status='queued', error=?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='running'`, reason, jobID)
+	if err != nil {
+		return fmt.Errorf("requeue job: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return fmt.Errorf("requeue job %d: it is no longer running", jobID)
+	}
+	return nil
+}
+
 // RecoverPendingJobs returns work interrupted by a process restart. Running
 // jobs are made queued again because no API request can survive the process.
+// Ready jobs already contain a transcript and only need Telegram publication.
 func (s *Store) RecoverPendingJobs(ctx context.Context) ([]int64, error) {
 	if _, err := s.db.ExecContext(ctx, `UPDATE jobs SET status='queued', error='recovered after restart', updated_at=CURRENT_TIMESTAMP WHERE status='running'`); err != nil {
 		return nil, fmt.Errorf("recover running jobs: %w", err)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id FROM jobs WHERE status='queued' ORDER BY id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM jobs WHERE status IN ('queued','ready') ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("read pending jobs: %w", err)
 	}
@@ -232,10 +251,25 @@ func (s *Store) RecoverPendingJobs(ctx context.Context) ([]int64, error) {
 }
 
 func (s *Store) CompleteJob(ctx context.Context, jobID int64, text, diarized, languages string, duration float64, processing time.Duration) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE jobs SET status='completed', text=?, diarized_text=?, detected_languages=?,
+	_, err := s.db.ExecContext(ctx, `UPDATE jobs SET status='ready', text=?, diarized_text=?, detected_languages=?,
         duration_seconds=?, processing_milliseconds=?, error='', updated_at=CURRENT_TIMESTAMP WHERE id=?`,
 		text, diarized, languages, duration, processing.Milliseconds(), jobID)
 	return err
+}
+
+func (s *Store) MarkJobPublished(ctx context.Context, jobID int64) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET status='completed', updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='ready'`, jobID)
+	if err != nil {
+		return fmt.Errorf("mark job published: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return fmt.Errorf("mark job %d published: it is not ready", jobID)
+	}
+	return nil
 }
 
 func (s *Store) FailJob(ctx context.Context, jobID int64, message string) error {
