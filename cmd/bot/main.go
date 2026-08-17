@@ -73,12 +73,22 @@ func run(args []string) int {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 1
 	}
-	allowedValue, err := config.Secret("TELEGRAM_ALLOWED_USER_IDS")
+	adminValue, err := config.Secret("TELEGRAM_ADMIN_USER_IDS")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 1
 	}
-	allowed, err := parseAllowedUsers(allowedValue)
+	admins, err := parseAllowedUsers(adminValue)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: TELEGRAM_ADMIN_USER_IDS:", err)
+		return 1
+	}
+	legacyAllowedValue, err := config.Secret("TELEGRAM_ALLOWED_USER_IDS")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	legacyAllowed, err := parseOptionalUsers(legacyAllowedValue)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: TELEGRAM_ALLOWED_USER_IDS:", err)
 		return 1
@@ -107,6 +117,10 @@ func run(args []string) int {
 		return 1
 	}
 	defer database.Close()
+	if err := database.InitializeAccess(context.Background(), userIDs(admins), userIDs(legacyAllowed)); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
 
 	telegramToken, err := config.Secret("TELEGRAM_BOT_TOKEN")
 	if err != nil {
@@ -125,17 +139,22 @@ func run(args []string) int {
 	}
 	if opts.check {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
 		me, err := telegramClient.GetMe(ctx)
-		cancel()
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "error: Telegram credentials check failed:", err)
 			return 1
 		}
-		fmt.Printf("configuration OK; Telegram bot @%s (id %d); allowed users: %d\n", me.Username, me.ID, len(allowed))
+		allowed, err := database.AuthorizedUsers(ctx)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error: read authorized users:", err)
+			return 1
+		}
+		fmt.Printf("configuration OK; Telegram bot @%s (id %d); administrators: %d; allowed users: %d\n", me.Username, me.ID, len(admins), len(allowed))
 		return 0
 	}
 	application, err := bot.New(telegramClient, database, service, bot.Config{
-		AllowedUsers: allowed, TempDir: opts.tempDir, MaxFileBytes: opts.maxMiB << 20,
+		AdminUsers: admins, TempDir: opts.tempDir, MaxFileBytes: opts.maxMiB << 20,
 		JobTimeout: opts.jobTimeout, QueueSize: opts.queueSize, RetentionDays: opts.retentionDays,
 	}, logger)
 	if err != nil {
@@ -144,7 +163,7 @@ func run(args []string) int {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	logger.Info("Tolmach bot started", "allowed_users", len(allowed), "queue_size", opts.queueSize)
+	logger.Info("Tolmach bot started", "administrators", len(admins), "queue_size", opts.queueSize)
 	err = application.Run(ctx)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("Tolmach bot stopped", "error", err)
@@ -206,6 +225,17 @@ func createService() (*transcription.Service, error) {
 }
 
 func parseAllowedUsers(value string) (map[int64]bool, error) {
+	result, err := parseOptionalUsers(value)
+	if err != nil {
+		return nil, err
+	}
+	if len(result) == 0 {
+		return nil, errors.New("at least one user ID is required")
+	}
+	return result, nil
+}
+
+func parseOptionalUsers(value string) (map[int64]bool, error) {
 	result := make(map[int64]bool)
 	for _, item := range strings.Split(value, ",") {
 		item = strings.TrimSpace(item)
@@ -218,10 +248,15 @@ func parseAllowedUsers(value string) (map[int64]bool, error) {
 		}
 		result[id] = true
 	}
-	if len(result) == 0 {
-		return nil, errors.New("at least one user ID is required")
-	}
 	return result, nil
+}
+
+func userIDs(users map[int64]bool) []int64 {
+	result := make([]int64, 0, len(users))
+	for userID := range users {
+		result = append(result, userID)
+	}
+	return result
 }
 
 func parseLogLevel(value string) (slog.Level, error) {

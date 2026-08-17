@@ -66,7 +66,7 @@ func TestVoiceMessageIsQueuedProcessedAndCached(t *testing.T) {
 	})
 	client, _ := telegram.NewClient("secret", telegram.Options{BaseURL: "https://telegram.test", HTTPClient: &http.Client{Transport: transport}})
 	engine := &fakeEngine{}
-	application, err := New(client, database, engine, Config{AllowedUsers: map[int64]bool{42: true}, TempDir: t.TempDir()}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	application, err := New(client, database, engine, Config{AdminUsers: map[int64]bool{42: true}, TempDir: t.TempDir()}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,6 +116,60 @@ func TestMediaExtensionNormalizesTelegramVoiceOGA(t *testing.T) {
 	}
 }
 
+func TestUnauthorizedUserCanRequestAndReceiveAccess(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "access.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	var requestKeyboard bool
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case "/botsecret/sendMessage":
+			var payload map[string]any
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload["chat_id"] == float64(42) && payload["reply_markup"] != nil {
+				requestKeyboard = true
+			}
+			return jsonResponse(request, http.StatusOK, `{"ok":true,"result":{"message_id":100,"chat":{"id":42,"type":"private"}}}`), nil
+		case "/botsecret/editMessageText":
+			return jsonResponse(request, http.StatusOK, `{"ok":true,"result":true}`), nil
+		case "/botsecret/answerCallbackQuery":
+			return jsonResponse(request, http.StatusOK, `{"ok":true,"result":true}`), nil
+		default:
+			t.Fatalf("unexpected request: %s %s", request.Method, request.URL.Path)
+			return nil, nil
+		}
+	})
+	client, _ := telegram.NewClient("secret", telegram.Options{BaseURL: "https://telegram.test", HTTPClient: &http.Client{Transport: transport}})
+	application, err := New(client, database, &fakeEngine{}, Config{AdminUsers: map[int64]bool{42: true}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestMessage := &telegram.Message{MessageID: 9, From: &telegram.User{ID: 99, Username: "new_user"}, Chat: telegram.Chat{ID: 99, Type: "private"}, Text: "/start"}
+	if err := application.HandleUpdate(context.Background(), telegram.Update{Message: requestMessage}); err != nil {
+		t.Fatal(err)
+	}
+	if !requestKeyboard {
+		t.Fatal("administrator did not receive an approval keyboard")
+	}
+	callback := &telegram.CallbackQuery{ID: "callback", From: telegram.User{ID: 42},
+		Message: &telegram.Message{MessageID: 100, Chat: telegram.Chat{ID: 42, Type: "private"}}, Data: "access:allow:99"}
+	if err := application.HandleUpdate(context.Background(), telegram.Update{CallbackQuery: callback}); err != nil {
+		t.Fatal(err)
+	}
+	if allowed, err := database.IsAuthorized(context.Background(), 99); err != nil || !allowed {
+		t.Fatalf("allowed=%v err=%v", allowed, err)
+	}
+	requestMessage.MessageID = 10
+	requestMessage.Text = "/help"
+	if err := application.HandleUpdate(context.Background(), telegram.Update{Message: requestMessage}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestActiveJobIsRequeuedWhenProcessContextIsCanceled(t *testing.T) {
 	database, err := store.Open(filepath.Join(t.TempDir(), "bot.db"))
 	if err != nil {
@@ -137,7 +191,7 @@ func TestActiveJobIsRequeuedWhenProcessContextIsCanceled(t *testing.T) {
 		}
 	})
 	client, _ := telegram.NewClient("secret", telegram.Options{BaseURL: "https://telegram.test", HTTPClient: &http.Client{Transport: transport}})
-	application, err := New(client, database, &fakeEngine{}, Config{AllowedUsers: map[int64]bool{42: true}, TempDir: t.TempDir()}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	application, err := New(client, database, &fakeEngine{}, Config{AdminUsers: map[int64]bool{42: true}, TempDir: t.TempDir()}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}

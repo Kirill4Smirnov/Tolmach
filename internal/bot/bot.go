@@ -22,7 +22,7 @@ import (
 const telegramTextLimit = 4000
 
 type Config struct {
-	AllowedUsers  map[int64]bool
+	AdminUsers    map[int64]bool
 	TempDir       string
 	MaxFileBytes  int64
 	JobTimeout    time.Duration
@@ -50,8 +50,8 @@ func New(client *telegram.Client, database *store.Store, service Engine, config 
 	if client == nil || database == nil || service == nil {
 		return nil, errors.New("bot dependencies cannot be nil")
 	}
-	if len(config.AllowedUsers) == 0 {
-		return nil, errors.New("Telegram allowlist cannot be empty")
+	if len(config.AdminUsers) == 0 {
+		return nil, errors.New("Telegram administrator list cannot be empty")
 	}
 	if config.MaxFileBytes <= 0 {
 		config.MaxFileBytes = 25 << 20
@@ -165,9 +165,16 @@ func (b *Bot) HandleUpdate(ctx context.Context, update telegram.Update) error {
 		return nil
 	}
 	message := update.Message
-	if !b.config.AllowedUsers[message.From.ID] {
+	allowed, err := b.isAuthorized(ctx, message.From.ID)
+	if err != nil {
+		return err
+	}
+	if !allowed {
 		b.logger.Warn("Rejected user", "user_id", message.From.ID)
-		return nil
+		if message.Chat.Type != "private" {
+			return nil
+		}
+		return b.handleAccessRequest(ctx, message)
 	}
 	if message.Chat.Type != "private" {
 		_, err := b.telegram.SendMessage(ctx, telegram.SendMessageRequest{ChatID: message.Chat.ID, Text: "Пока я работаю только в личных чатах."})
@@ -197,11 +204,54 @@ func (b *Bot) HandleUpdate(ctx context.Context, update telegram.Update) error {
 	})
 }
 
+func (b *Bot) isAuthorized(ctx context.Context, userID int64) (bool, error) {
+	if b.config.AdminUsers[userID] {
+		return true, nil
+	}
+	return b.store.IsAuthorized(ctx, userID)
+}
+
+func (b *Bot) handleAccessRequest(ctx context.Context, message *telegram.Message) error {
+	notify, status, err := b.store.RegisterAccessRequest(ctx, message.From.ID, message.From.Username)
+	if err != nil {
+		return err
+	}
+	response := fmt.Sprintf("Ваш Telegram ID: %d\n\nЗаявка на доступ уже ожидает решения администратора.", message.From.ID)
+	if status == "denied" {
+		response = fmt.Sprintf("Ваш Telegram ID: %d\n\nДоступ пока не разрешён. Повторную заявку можно отправить через 24 часа.", message.From.ID)
+	} else if notify {
+		response = fmt.Sprintf("Ваш Telegram ID: %d\n\nЗаявка на доступ отправлена администратору.", message.From.ID)
+	}
+	if _, err := b.telegram.SendMessage(ctx, telegram.SendMessageRequest{ChatID: message.Chat.ID, ReplyToMessageID: message.MessageID, Text: response}); err != nil {
+		return err
+	}
+	if !notify {
+		return nil
+	}
+	username := "не указан"
+	if message.From.Username != "" {
+		username = "@" + message.From.Username
+	}
+	text := fmt.Sprintf("Заявка на доступ\n\nID: %d\nUsername: %s", message.From.ID, username)
+	markup := accessRequestKeyboard(message.From.ID)
+	for adminID := range b.config.AdminUsers {
+		if _, err := b.telegram.SendMessage(ctx, telegram.SendMessageRequest{ChatID: adminID, Text: text, ReplyMarkup: markup}); err != nil {
+			b.logger.Error("Access request notification failed", "admin_user_id", adminID, "requester_user_id", message.From.ID, "error", err)
+		}
+	}
+	b.logger.Info("Access requested", "user_id", message.From.ID)
+	return nil
+}
+
 func (b *Bot) handleCommand(ctx context.Context, message *telegram.Message) error {
 	command, argument := parseCommand(message.Text)
 	switch command {
 	case "start", "help":
-		return b.sendText(ctx, message.Chat.ID, message.MessageID, helpText())
+		text := helpText()
+		if b.config.AdminUsers[message.From.ID] {
+			text += "\n\nАдминистрирование:\n/users — список пользователей\n/requests — ожидающие заявки\n/allow ID — разрешить доступ\n/deny ID — отозвать доступ"
+		}
+		return b.sendText(ctx, message.Chat.ID, message.MessageID, text)
 	case "settings":
 		settings, err := b.store.Settings(ctx, message.From.ID)
 		if err != nil {
@@ -240,9 +290,111 @@ func (b *Bot) handleCommand(ctx context.Context, message *telegram.Message) erro
 		return b.handleTranslate(ctx, message, strings.ToLower(argument))
 	case "cancel":
 		return b.handleCancel(ctx, message)
+	case "allow":
+		return b.handleAllow(ctx, message, argument)
+	case "deny":
+		return b.handleDeny(ctx, message, argument)
+	case "users":
+		return b.handleUsers(ctx, message)
+	case "requests":
+		return b.handleRequests(ctx, message)
 	default:
 		return b.sendText(ctx, message.Chat.ID, message.MessageID, "Неизвестная команда. Используйте /help.")
 	}
+}
+
+func (b *Bot) handleAllow(ctx context.Context, message *telegram.Message, argument string) error {
+	if !b.config.AdminUsers[message.From.ID] {
+		return b.sendText(ctx, message.Chat.ID, message.MessageID, "Команда доступна только администратору.")
+	}
+	userID, ok := parseUserID(argument)
+	if !ok {
+		return b.sendText(ctx, message.Chat.ID, message.MessageID, "Использование: /allow 123456789")
+	}
+	created, err := b.store.AuthorizeUser(ctx, userID, message.From.ID)
+	if err != nil {
+		return err
+	}
+	text := fmt.Sprintf("Пользователь %d уже был в списке.", userID)
+	if created {
+		text = fmt.Sprintf("Доступ для %d разрешён.", userID)
+		b.logger.Info("User authorized", "user_id", userID, "admin_user_id", message.From.ID)
+	}
+	if _, err := b.telegram.SendMessage(ctx, telegram.SendMessageRequest{ChatID: userID, Text: "Доступ к Tolmach разрешён. Отправьте голосовое сообщение, аудио или видео."}); err != nil {
+		b.logger.Warn("Authorized user notification failed", "user_id", userID, "error", err)
+	}
+	return b.sendText(ctx, message.Chat.ID, message.MessageID, text)
+}
+
+func (b *Bot) handleDeny(ctx context.Context, message *telegram.Message, argument string) error {
+	if !b.config.AdminUsers[message.From.ID] {
+		return b.sendText(ctx, message.Chat.ID, message.MessageID, "Команда доступна только администратору.")
+	}
+	userID, ok := parseUserID(argument)
+	if !ok {
+		return b.sendText(ctx, message.Chat.ID, message.MessageID, "Использование: /deny 123456789")
+	}
+	if b.config.AdminUsers[userID] {
+		return b.sendText(ctx, message.Chat.ID, message.MessageID, "Администратора нельзя удалить через Telegram.")
+	}
+	removed, err := b.store.RevokeUser(ctx, userID, message.From.ID)
+	if err != nil {
+		return err
+	}
+	text := fmt.Sprintf("Заявка %d отклонена; пользователя не было в списке.", userID)
+	if removed {
+		text = fmt.Sprintf("Доступ для %d отозван.", userID)
+		b.logger.Info("User access revoked", "user_id", userID, "admin_user_id", message.From.ID)
+	}
+	if _, err := b.telegram.SendMessage(ctx, telegram.SendMessageRequest{ChatID: userID, Text: "Администратор Tolmach не разрешил доступ к боту."}); err != nil {
+		b.logger.Warn("Denied user notification failed", "user_id", userID, "error", err)
+	}
+	return b.sendText(ctx, message.Chat.ID, message.MessageID, text)
+}
+
+func (b *Bot) handleUsers(ctx context.Context, message *telegram.Message) error {
+	if !b.config.AdminUsers[message.From.ID] {
+		return b.sendText(ctx, message.Chat.ID, message.MessageID, "Команда доступна только администратору.")
+	}
+	users, err := b.store.AuthorizedUsers(ctx)
+	if err != nil {
+		return err
+	}
+	var text strings.Builder
+	fmt.Fprintf(&text, "Разрешённые пользователи: %d\n", len(users))
+	for _, user := range users {
+		fmt.Fprintf(&text, "\n%d", user.UserID)
+		if user.Username != "" {
+			fmt.Fprintf(&text, " @%s", user.Username)
+		}
+		if b.config.AdminUsers[user.UserID] {
+			text.WriteString(" · admin")
+		}
+	}
+	return b.sendText(ctx, message.Chat.ID, message.MessageID, text.String())
+}
+
+func (b *Bot) handleRequests(ctx context.Context, message *telegram.Message) error {
+	if !b.config.AdminUsers[message.From.ID] {
+		return b.sendText(ctx, message.Chat.ID, message.MessageID, "Команда доступна только администратору.")
+	}
+	requests, err := b.store.PendingAccessRequests(ctx)
+	if err != nil {
+		return err
+	}
+	if len(requests) == 0 {
+		return b.sendText(ctx, message.Chat.ID, message.MessageID, "Ожидающих заявок нет.")
+	}
+	var text strings.Builder
+	fmt.Fprintf(&text, "Ожидающие заявки: %d\n", len(requests))
+	for _, request := range requests {
+		fmt.Fprintf(&text, "\n%d", request.UserID)
+		if request.Username != "" {
+			fmt.Fprintf(&text, " @%s", request.Username)
+		}
+	}
+	text.WriteString("\n\nИспользуйте /allow ID или /deny ID.")
+	return b.sendText(ctx, message.Chat.ID, message.MessageID, text.String())
 }
 
 func (b *Bot) handleTranslate(ctx context.Context, message *telegram.Message, target string) error {
@@ -323,7 +475,17 @@ func (b *Bot) handleCancel(ctx context.Context, message *telegram.Message) error
 }
 
 func (b *Bot) handleCallback(ctx context.Context, callback *telegram.CallbackQuery) error {
-	if !b.config.AllowedUsers[callback.From.ID] || callback.Message == nil || callback.Message.Chat.Type != "private" {
+	if callback.Message == nil || callback.Message.Chat.Type != "private" {
+		return b.telegram.AnswerCallback(ctx, callback.ID, "Недоступно", true)
+	}
+	if strings.HasPrefix(callback.Data, "access:") {
+		return b.handleAccessCallback(ctx, callback)
+	}
+	allowed, err := b.isAuthorized(ctx, callback.From.ID)
+	if err != nil {
+		return err
+	}
+	if !allowed {
 		return b.telegram.AnswerCallback(ctx, callback.ID, "Недоступно", true)
 	}
 	parts := strings.Split(callback.Data, ":")
@@ -365,6 +527,62 @@ func (b *Bot) handleCallback(ctx context.Context, callback *telegram.CallbackQue
 	default:
 		return b.telegram.AnswerCallback(ctx, callback.ID, "Кнопка устарела", true)
 	}
+}
+
+func (b *Bot) handleAccessCallback(ctx context.Context, callback *telegram.CallbackQuery) error {
+	if !b.config.AdminUsers[callback.From.ID] {
+		return b.telegram.AnswerCallback(ctx, callback.ID, "Только для администратора", true)
+	}
+	parts := strings.Split(callback.Data, ":")
+	if len(parts) != 3 {
+		return b.telegram.AnswerCallback(ctx, callback.ID, "Кнопка устарела", true)
+	}
+	userID, ok := parseUserID(parts[2])
+	if !ok {
+		return b.telegram.AnswerCallback(ctx, callback.ID, "Кнопка устарела", true)
+	}
+	var statusText, callbackText, userText string
+	switch parts[1] {
+	case "allow":
+		changed, err := b.store.ResolveAccessRequest(ctx, userID, callback.From.ID, true)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return b.telegram.AnswerCallback(ctx, callback.ID, "Заявка уже обработана", true)
+		}
+		statusText = fmt.Sprintf("Доступ для %d разрешён администратором %d.", userID, callback.From.ID)
+		callbackText = "Доступ разрешён"
+		userText = "Доступ к Tolmach разрешён. Отправьте голосовое сообщение, аудио или видео."
+		b.logger.Info("User authorized", "user_id", userID, "admin_user_id", callback.From.ID)
+	case "deny":
+		if b.config.AdminUsers[userID] {
+			return b.telegram.AnswerCallback(ctx, callback.ID, "Администратора нельзя удалить", true)
+		}
+		changed, err := b.store.ResolveAccessRequest(ctx, userID, callback.From.ID, false)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return b.telegram.AnswerCallback(ctx, callback.ID, "Заявка уже обработана", true)
+		}
+		statusText = fmt.Sprintf("Заявка %d отклонена администратором %d.", userID, callback.From.ID)
+		callbackText = "Заявка отклонена"
+		userText = "Администратор Tolmach не разрешил доступ к боту."
+		b.logger.Info("Access request denied", "user_id", userID, "admin_user_id", callback.From.ID)
+	default:
+		return b.telegram.AnswerCallback(ctx, callback.ID, "Кнопка устарела", true)
+	}
+	if err := b.telegram.EditMessage(ctx, callback.Message.Chat.ID, callback.Message.MessageID, statusText, nil); err != nil {
+		return err
+	}
+	if err := b.telegram.AnswerCallback(ctx, callback.ID, callbackText, false); err != nil {
+		return err
+	}
+	if _, err := b.telegram.SendMessage(ctx, telegram.SendMessageRequest{ChatID: userID, Text: userText}); err != nil {
+		b.logger.Warn("Access decision notification failed", "user_id", userID, "error", err)
+	}
+	return nil
 }
 
 func cloneJob(original store.Job, provider string, diarization bool) store.Job {
@@ -663,6 +881,14 @@ func providerKeyboard(jobID int64) *telegram.InlineKeyboardMarkup {
 	}}
 }
 
+func accessRequestKeyboard(userID int64) *telegram.InlineKeyboardMarkup {
+	id := strconv.FormatInt(userID, 10)
+	return &telegram.InlineKeyboardMarkup{InlineKeyboard: [][]telegram.InlineKeyboardButton{{
+		{Text: "✅ Разрешить", CallbackData: "access:allow:" + id},
+		{Text: "❌ Отклонить", CallbackData: "access:deny:" + id},
+	}}}
+}
+
 func renderJob(job store.Job) string {
 	text := job.Text
 	if job.Diarization && job.DiarizedText != "" {
@@ -696,6 +922,11 @@ func parseCommand(text string) (string, string) {
 		argument = strings.TrimSpace(fields[1])
 	}
 	return command, argument
+}
+
+func parseUserID(value string) (int64, bool) {
+	userID, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	return userID, err == nil && userID > 0
 }
 
 func validLanguage(language string) bool {

@@ -14,14 +14,23 @@ Soniox или Speechmatics.
 /diarization_provider soniox    провайдер диаризации
 /translate en                   перевод ответа на транскрипцию
 /cancel                         отмена обработки
+/users                          список пользователей (admin)
+/requests                       ожидающие заявки (admin)
+/allow 123456789                разрешить доступ (admin)
+/deny 123456789                 отозвать доступ (admin)
 ```
 
 Без аргумента `/translate` переводит на русский или на последний выбранный
 язык. Команду нужно отправлять ответом на первое сообщение транскрипции.
 
+Новый пользователь отправляет боту `/start`; администратор получает заявку с
+кнопками «Разрешить» и «Отклонить». Allowlist хранится в SQLite.
+
 ## Локальный запуск
 
-Требуется Go 1.26+. Заполните все нужные секреты в `.env`, включая Telegram-токен и `TELEGRAM_ALLOWED_USER_IDS`.
+Требуется Go 1.26+. Заполните секреты в `.env` и задайте
+`TELEGRAM_ADMIN_USER_IDS`. Старый `TELEGRAM_ALLOWED_USER_IDS` импортируется в
+SQLite один раз и затем не обязателен.
 
 ```sh
 CGO_ENABLED=0 go build -trimpath -o tolmach-bot ./cmd/bot

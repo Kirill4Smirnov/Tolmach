@@ -92,3 +92,55 @@ func TestSettingsJobsCacheAndTranslations(t *testing.T) {
 		t.Fatalf("requeued=%#v err=%v", requeued, err)
 	}
 }
+
+func TestPersistentAccessManagementAndLegacyImport(t *testing.T) {
+	database, err := Open(filepath.Join(t.TempDir(), "access.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	ctx := context.Background()
+	if err := database.InitializeAccess(ctx, []int64{1}, []int64{2}); err != nil {
+		t.Fatal(err)
+	}
+	for _, userID := range []int64{1, 2} {
+		if allowed, err := database.IsAuthorized(ctx, userID); err != nil || !allowed {
+			t.Fatalf("user %d allowed=%v err=%v", userID, allowed, err)
+		}
+	}
+	if removed, err := database.RevokeUser(ctx, 2, 1); err != nil || !removed {
+		t.Fatalf("removed=%v err=%v", removed, err)
+	}
+	// The legacy environment allowlist is not reimported after a restart.
+	if err := database.InitializeAccess(ctx, []int64{1}, []int64{2}); err != nil {
+		t.Fatal(err)
+	}
+	if allowed, err := database.IsAuthorized(ctx, 2); err != nil || allowed {
+		t.Fatalf("revoked legacy user allowed=%v err=%v", allowed, err)
+	}
+
+	notify, status, err := database.RegisterAccessRequest(ctx, 3, "new_user")
+	if err != nil || !notify || status != "pending" {
+		t.Fatalf("notify=%v status=%q err=%v", notify, status, err)
+	}
+	if notify, _, err := database.RegisterAccessRequest(ctx, 3, "new_user"); err != nil || notify {
+		t.Fatalf("duplicate notify=%v err=%v", notify, err)
+	}
+	requests, err := database.PendingAccessRequests(ctx)
+	if err != nil || len(requests) != 1 || requests[0].UserID != 3 {
+		t.Fatalf("requests=%#v err=%v", requests, err)
+	}
+	if changed, err := database.ResolveAccessRequest(ctx, 3, 1, true); err != nil || !changed {
+		t.Fatalf("changed=%v err=%v", changed, err)
+	}
+	if changed, err := database.ResolveAccessRequest(ctx, 3, 1, false); err != nil || changed {
+		t.Fatalf("stale decision changed=%v err=%v", changed, err)
+	}
+	if allowed, err := database.IsAuthorized(ctx, 3); err != nil || !allowed {
+		t.Fatalf("approved user allowed=%v err=%v", allowed, err)
+	}
+	users, err := database.AuthorizedUsers(ctx)
+	if err != nil || len(users) != 2 || users[1].Username != "new_user" {
+		t.Fatalf("users=%#v err=%v", users, err)
+	}
+}

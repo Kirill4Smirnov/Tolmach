@@ -24,6 +24,19 @@ type Settings struct {
 	TranslationLanguage string
 }
 
+type AuthorizedUser struct {
+	UserID    int64
+	Username  string
+	AddedBy   int64
+	CreatedAt string
+}
+
+type AccessRequest struct {
+	UserID      int64
+	Username    string
+	RequestedAt string
+}
+
 type Job struct {
 	ID                     int64
 	UserID                 int64
@@ -129,6 +142,19 @@ func (s *Store) migrate(ctx context.Context) error {
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY(job_id, language, model)
         )`,
+		`CREATE TABLE IF NOT EXISTS authorized_users (
+            user_id INTEGER PRIMARY KEY,
+            added_by INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )`,
+		`CREATE TABLE IF NOT EXISTS access_requests (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL CHECK(status IN ('pending','approved','denied')),
+            requested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            decided_at TEXT NOT NULL DEFAULT '',
+            decided_by INTEGER NOT NULL DEFAULT 0
+        )`,
 		`CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
 	}
 	for _, statement := range statements {
@@ -137,6 +163,196 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// InitializeAccess keeps configured administrators authorized and imports the
+// old environment allowlist exactly once. This lets administrators later
+// revoke legacy users without them reappearing after a restart.
+func (s *Store) InitializeAccess(ctx context.Context, administratorIDs, legacyAllowedIDs []int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin access initialization: %w", err)
+	}
+	defer tx.Rollback()
+	for _, userID := range administratorIDs {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO authorized_users(user_id,added_by) VALUES(?,0)
+            ON CONFLICT(user_id) DO NOTHING`, userID); err != nil {
+			return fmt.Errorf("authorize administrator: %w", err)
+		}
+	}
+	var imported string
+	err = tx.QueryRowContext(ctx, `SELECT value FROM metadata WHERE key='legacy_allowlist_imported'`).Scan(&imported)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read legacy allowlist state: %w", err)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		for _, userID := range legacyAllowedIDs {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO authorized_users(user_id,added_by) VALUES(?,0)
+                    ON CONFLICT(user_id) DO NOTHING`, userID); err != nil {
+				return fmt.Errorf("import legacy allowed user: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO metadata(key,value) VALUES('legacy_allowlist_imported','1')`); err != nil {
+			return fmt.Errorf("save legacy allowlist state: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit access initialization: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) IsAuthorized(ctx context.Context, userID int64) (bool, error) {
+	var exists int
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM authorized_users WHERE user_id=?)`, userID).Scan(&exists)
+	return exists == 1, err
+}
+
+func (s *Store) AuthorizeUser(ctx context.Context, userID, addedBy int64) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `INSERT INTO authorized_users(user_id,added_by) VALUES(?,?)
+        ON CONFLICT(user_id) DO NOTHING`, userID, addedBy)
+	if err != nil {
+		return false, fmt.Errorf("authorize user: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE access_requests SET status='approved',decided_at=CURRENT_TIMESTAMP,decided_by=? WHERE user_id=?`, addedBy, userID); err != nil {
+		return false, fmt.Errorf("approve access request: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return changed == 1, nil
+}
+
+func (s *Store) RevokeUser(ctx context.Context, userID, decidedBy int64) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `DELETE FROM authorized_users WHERE user_id=?`, userID)
+	if err != nil {
+		return false, fmt.Errorf("revoke user: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO access_requests(user_id,status,requested_at,decided_at,decided_by)
+		VALUES(?,'denied',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,?)
+		ON CONFLICT(user_id) DO UPDATE SET status='denied',requested_at=CURRENT_TIMESTAMP,
+			decided_at=CURRENT_TIMESTAMP,decided_by=excluded.decided_by`, userID, decidedBy); err != nil {
+		return false, fmt.Errorf("deny access request: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return changed == 1, nil
+}
+
+// ResolveAccessRequest applies only the first decision. This makes duplicate
+// buttons sent to multiple administrators safe against conflicting clicks.
+func (s *Store) ResolveAccessRequest(ctx context.Context, userID, decidedBy int64, allow bool) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	status := "denied"
+	if allow {
+		status = "approved"
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE access_requests SET status=?,decided_at=CURRENT_TIMESTAMP,decided_by=?
+        WHERE user_id=? AND status='pending'`, status, decidedBy, userID)
+	if err != nil {
+		return false, fmt.Errorf("resolve access request: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if changed == 0 {
+		return false, nil
+	}
+	if allow {
+		_, err = tx.ExecContext(ctx, `INSERT INTO authorized_users(user_id,added_by) VALUES(?,?)
+            ON CONFLICT(user_id) DO NOTHING`, userID, decidedBy)
+	} else {
+		_, err = tx.ExecContext(ctx, `DELETE FROM authorized_users WHERE user_id=?`, userID)
+	}
+	if err != nil {
+		return false, fmt.Errorf("apply access decision: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// RegisterAccessRequest returns notify=true for a new request. A denied user
+// may submit another request after 24 hours; pending requests do not spam the
+// administrators on every message.
+func (s *Store) RegisterAccessRequest(ctx context.Context, userID int64, username string) (notify bool, status string, err error) {
+	result, err := s.db.ExecContext(ctx, `INSERT INTO access_requests(user_id,username,status)
+        VALUES(?,?,'pending')
+        ON CONFLICT(user_id) DO UPDATE SET username=excluded.username,status='pending',requested_at=CURRENT_TIMESTAMP,
+            decided_at='',decided_by=0
+		WHERE access_requests.status='denied' AND access_requests.decided_at < datetime('now','-1 day')`, userID, username)
+	if err != nil {
+		return false, "", fmt.Errorf("register access request: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, "", err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT status FROM access_requests WHERE user_id=?`, userID).Scan(&status); err != nil {
+		return false, "", fmt.Errorf("read access request: %w", err)
+	}
+	return changed == 1, status, nil
+}
+
+func (s *Store) AuthorizedUsers(ctx context.Context) ([]AuthorizedUser, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT u.user_id,COALESCE(r.username,''),u.added_by,u.created_at
+        FROM authorized_users u LEFT JOIN access_requests r ON r.user_id=u.user_id ORDER BY u.user_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var users []AuthorizedUser
+	for rows.Next() {
+		var user AuthorizedUser
+		if err := rows.Scan(&user.UserID, &user.Username, &user.AddedBy, &user.CreatedAt); err != nil {
+			return nil, err
+		}
+		users = append(users, user)
+	}
+	return users, rows.Err()
+}
+
+func (s *Store) PendingAccessRequests(ctx context.Context) ([]AccessRequest, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT user_id,username,requested_at FROM access_requests
+        WHERE status='pending' ORDER BY requested_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var requests []AccessRequest
+	for rows.Next() {
+		var request AccessRequest
+		if err := rows.Scan(&request.UserID, &request.Username, &request.RequestedAt); err != nil {
+			return nil, err
+		}
+		requests = append(requests, request)
+	}
+	return requests, rows.Err()
 }
 
 func (s *Store) Settings(ctx context.Context, userID int64) (Settings, error) {
